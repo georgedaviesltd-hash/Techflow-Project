@@ -1,15 +1,20 @@
-name: TechFlow CI/CD Pipeline
+
+name: CI/CD Pipeline
 
 on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
-
+  # ─── Job 1: Run Tests ───────────────────────────────────────────────────────
   test:
-    name: Test Application
+    name: Run Tests
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,119 +27,131 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run tests
+      - name: Run pytest
         run: pytest test_app.py -v
 
-
+  # ─── Job 2: Build & Push Docker Image ───────────────────────────────────────
   build-and-push:
-    name: Build and Push Docker Image
-    needs: test
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
+    needs: test  # Only runs if tests pass
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Log in to DockerHub
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:${{ github.sha }} .
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:${{ github.sha }}
 
-      - name: Push Docker image
-        run: |
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:${{ github.sha }}
-
-
+  # ─── Job 3: Deploy to EC2 ───────────────────────────────────────────────────
   deploy:
     name: Deploy to EC2
-    needs: build-and-push
     runs-on: ubuntu-latest
+    needs: build-and-push  # Only runs if build passes
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # MANDATORY FIX: Transfer scripts from GitHub runner over to EC2 instance
-      - name: Copy scripts to server
+      - name: Copy scripts to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: "scripts/*"
-          target: "~/app"
+          source: "scripts/"
+          target: "/home/ubuntu/"
 
-      - name: Deploy application
-        uses: appleboy/ssh-action@v1.2.2
+      - name: Deploy on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DOCKERHUB_USERNAME
           script: |
-            cd ~/app
-            chmod +x scripts/*.sh
+            export DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+            export IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest"
 
-            # 6. STABLE VERSION STRETCH GOAL: Tag running image before pulling new one
-            ./scripts/tag_stable.sh || echo "No existing image to tag as baseline."
+            # Make scripts executable
+            chmod +x /home/ubuntu/scripts/*.sh
 
-            # Log in and grab the fresh image build
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
+            # Tag current running image as previous_stable (for rollback)
+            /home/ubuntu/scripts/tag_stable.sh "$DOCKERHUB_USERNAME" || echo "No previous stable to tag"
 
-            # Clear out old environment
-            docker stop techflow-app || true
-            docker rm techflow-app || true
+            # Pull latest image
+            docker pull "$IMAGE"
 
-            # Run new server instance (Port 80 mapped to internal 5000)
+            # Stop and remove old container (if running)
+            docker stop techflow-app 2>/dev/null || true
+            docker rm   techflow-app 2>/dev/null || true
+
+            # Start new container
             docker run -d \
               --name techflow-app \
+              --restart unless-stopped \
               -p 80:5000 \
-              ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
+              "$IMAGE"
 
-            # 4 & 5. MANDATORY HEALTH CHECK & AUTOMATIC ROLLBACK INTEGRATION
-            ./scripts/health_check.sh
-            if [ $? -ne 0 ]; then
-               echo "Health validation failed! Invoking automated rollback script..."
-               ./scripts/rollback.sh
-               exit 1
+            # Health check — rollback on failure
+            if /home/ubuntu/scripts/health_check.sh; then
+              echo "✅ Deployment successful!"
+            else
+              echo "❌ Health check failed — rolling back..."
+              /home/ubuntu/scripts/rollback.sh "$DOCKERHUB_USERNAME"
+              exit 1
             fi
-            echo "Deployment fully verified!"
 
-
-  # 7. MANDATORY NOTIFICATIONS JOB
-  send-notification:
-    name: Send Pipeline Status Email
-    runs-on: ubuntu-latest
-    needs: [test, build-and-push, deploy]
-    if: always() # Ensures it runs even if a previous step crashes
-    steps:
-      - name: Determine Pipeline Outcomes
-        id: status
-        run: |
-          if [[ "${{ needs.test.result }}" == "success" && "${{ needs.build-and-push.result }}" == "success" && "${{ needs.deploy.result }}" == "success" ]]; then
-            echo "final_state=Success" >> $GITHUB_OUTPUT
-          else
-            echo "final_state=Failure" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Send status email
+      - name: Send success email
+        if: success()
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ://gmail.com
+          server_address: smtp.gmail.com
           server_port: 465
+          secure: true
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_APP_PASSWORD }}
-          subject: TechFlow Pipeline - ${{ steps.status.outputs.final_state }}
+          subject: "✅ TechFlow Deployment Succeeded — ${{ github.sha }}"
           to: ${{ secrets.NOTIFY_EMAIL }}
-          from: GitHub CI/CD System
+          from: ${{ secrets.EMAIL_USERNAME }}
           body: |
-            TechFlow Automated Deployment Summary:
-            - Commit Hash: ${{ github.sha }}
-            - Author: ${{ github.actor }}
-            - Final Status: ${{ steps.status.outputs.final_state }}
+            🚀 Deployment to production was successful!
+
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Triggered by: ${{ github.actor }}
+
+            Your app is live at: http://${{ secrets.EC2_HOST }}
+
+      - name: Send failure email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: "❌ TechFlow Deployment FAILED — ${{ github.sha }}"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: |
+            ⚠️ Deployment failed and was automatically rolled back.
+
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Triggered by: ${{ github.actor }}
+
+            Check the Actions tab for logs: https://github.com/${{ github.repository }}/actions
