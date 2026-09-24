@@ -1,0 +1,140 @@
+name: TechFlow CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  test:
+    name: Test Application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest test_app.py -v
+
+
+  build-and-push:
+    name: Build and Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:${{ github.sha }} .
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:${{ github.sha }}
+
+
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # MANDATORY FIX: Transfer scripts from GitHub runner over to EC2 instance
+      - name: Copy scripts to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "scripts/*"
+          target: "~/app"
+
+      - name: Deploy application
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/app
+            chmod +x scripts/*.sh
+
+            # 6. STABLE VERSION STRETCH GOAL: Tag running image before pulling new one
+            ./scripts/tag_stable.sh || echo "No existing image to tag as baseline."
+
+            # Log in and grab the fresh image build
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
+
+            # Clear out old environment
+            docker stop techflow-app || true
+            docker rm techflow-app || true
+
+            # Run new server instance (Port 80 mapped to internal 5000)
+            docker run -d \
+              --name techflow-app \
+              -p 80:5000 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/techflow-app:latest
+
+            # 4 & 5. MANDATORY HEALTH CHECK & AUTOMATIC ROLLBACK INTEGRATION
+            ./scripts/health_check.sh
+            if [ $? -ne 0 ]; then
+               echo "Health validation failed! Invoking automated rollback script..."
+               ./scripts/rollback.sh
+               exit 1
+            fi
+            echo "Deployment fully verified!"
+
+
+  # 7. MANDATORY NOTIFICATIONS JOB
+  send-notification:
+    name: Send Pipeline Status Email
+    runs-on: ubuntu-latest
+    needs: [test, build-and-push, deploy]
+    if: always() # Ensures it runs even if a previous step crashes
+    steps:
+      - name: Determine Pipeline Outcomes
+        id: status
+        run: |
+          if [[ "${{ needs.test.result }}" == "success" && "${{ needs.build-and-push.result }}" == "success" && "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "final_state=Success" >> $GITHUB_OUTPUT
+          else
+            echo "final_state=Failure" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send status email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ://gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: TechFlow Pipeline - ${{ steps.status.outputs.final_state }}
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: GitHub CI/CD System
+          body: |
+            TechFlow Automated Deployment Summary:
+            - Commit Hash: ${{ github.sha }}
+            - Author: ${{ github.actor }}
+            - Final Status: ${{ steps.status.outputs.final_state }}
